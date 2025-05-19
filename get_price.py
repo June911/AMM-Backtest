@@ -71,17 +71,22 @@ def fetch_price_data(
     filename = f"{symbol.replace('/', '_')}_{timeframe}.csv"
     filepath = os.path.join("data", filename)
 
-    # 如果本地已存在数据且不强制刷新，直接读取
+    # 如果本地已存在数据且不强制刷新，直接读取并过滤日期范围
     if os.path.exists(filepath) and not force_refresh:
         print(f"已检测到本地数据文件 {filepath}，直接读取")
-        return pd.read_csv(filepath)
+        data = pd.read_csv(filepath)
+        data["timestamp"] = pd.to_datetime(data["timestamp"])
+        mask = (data["timestamp"] >= pd.to_datetime(start_date)) & (
+            data["timestamp"] <= pd.to_datetime(end_date)
+        )
+        return data[mask]
 
     print("开始抓取历史数据……")
 
     fetcher = DataFetcher()
-
     all_data = []
     current_start = start_date
+    end_datetime = pd.to_datetime(end_date)
 
     while True:
         batch_data = fetcher.fetch_ohlcv(symbol, current_start, end_date, timeframe)
@@ -89,7 +94,12 @@ def fetch_price_data(
         if batch_data is None or len(batch_data) == 0:
             break
 
-        all_data.append(batch_data)
+        # 过滤掉超过结束日期的数据
+        batch_data["timestamp"] = pd.to_datetime(batch_data["timestamp"])
+        batch_data = batch_data[batch_data["timestamp"] <= end_datetime]
+
+        if len(batch_data) > 0:
+            all_data.append(batch_data)
 
         # 如果获取的数据量小于限制，说明已经获取完所有数据
         if len(batch_data) < 1000:
