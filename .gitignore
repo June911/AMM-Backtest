@@ -1,5 +1,6 @@
 data/
 venv/
+backtest_results/
 v2_backtest_results/
 v3_backtest_results/
 

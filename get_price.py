@@ -123,8 +123,8 @@ def fetch_price_data(
 def main():
     # 参数设置
     symbol = "APT/USDT"
-    start_date = "2025-04-01"
-    end_date = "2025-04-10"
+    start_date = "2022-12-29"
+    end_date = "2023-01-26"
     timeframe = "1h"
 
     # 如果本地不存在对应数据，则自动抓取

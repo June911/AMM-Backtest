@@ -250,11 +250,13 @@ class UniswapV2Strategy:
 
         # 计算年化率
         def annualize(rate):
-            # 将百分比转换为小数
-            rate_decimal = rate / 100
-            # 计算年化率
+            """按线性方式（简单比例外推）计算年化收益率。
+
+            与原先使用的几何复利不同，这里采用 R_annual = R_total / years，
+            更适合在回测周期较短、且无法确保收益按复利连续滚动的场景。
+            """
             if years > 0:
-                return ((1 + rate_decimal) ** (1 / years) - 1) * 100
+                return rate / years
             return rate
 
         hedge_vs_hodl_annual = annualize(hedge_vs_hodl_return)
@@ -577,7 +579,7 @@ class UniswapV2Strategy:
                 f"{save_path}/threshold_comparison.png", dpi=300, bbox_inches="tight"
             )
 
-        plt.show()
+        # plt.show()
 
 
 def generate_price_data(
@@ -616,27 +618,29 @@ if __name__ == "__main__":
     # 初始化参数
     initial_capital = 100000  # 10万USDT
     price_threshold = 0.01  # 2%价格波动触发对冲
-    funding_rate = 0.00001  # 5%年化资金费率
+    funding_rate = 0.2  # 5%年化资金费率
 
     # 创建保存目录
     save_dir = "backtest_results"
     os.makedirs(save_dir, exist_ok=True)
 
     # 生成测试数据 (2025-2-1 到 2025-4-1)
-    data = generate_price_data(
-        start_price=3500,
-        start_date="2025-02-01",
-        end_date="2025-04-01",
-        volatility=0.02,  # 日波动率
-        drift=0.0001,  # 平均日收益率
-    )
+    filename = "APT_USDT_1h.csv"
+    data = pd.read_csv(f"data/{filename}")
+    # data = generate_price_data(
+    #     start_price=3500,
+    #     start_date="2025-02-01",
+    #     end_date="2025-04-01",
+    #     volatility=0.02,  # 日波动率
+    #     drift=0.0001,  # 平均日收益率
+    # )
 
     # 创建策略实例
     strategy = UniswapV2Strategy(
         initial_capital=initial_capital,
         price_threshold=price_threshold,
         funding_rate=funding_rate,
-        gas_cost_per_hedge=0.001,  # 对冲成本为交易量的0.1%
+        gas_cost_per_hedge=0.01,  # 对冲成本为交易量的0.1%
     )
 
     # 运行回测
