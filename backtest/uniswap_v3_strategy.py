@@ -228,9 +228,21 @@ class UniswapV3Strategy:
         initial_price = data.iloc[0]["close"]
         self.initialize_position(initial_price)
 
-        # 重置累积对冲盈亏和手续费收入
+        # 重置累积状态(同一实例多次run不互相污染)
         self.cumulative_hedge_pnl = 0
         self.total_fee_income = 0
+        self.total_hedge_cost = 0
+        self.total_funding_cost = 0
+        self.hedge_count = 0
+        self.hedge_history = []
+
+        # 手续费按行间实际时间差计费(首行无时间流逝不计费)，
+        # 兼容缺失K线与非小时数据；乱序数据的负时间差按0处理
+        if self.fee_apr:
+            ts = pd.to_datetime(data["timestamp"])
+            fee_hours = ts.diff().dt.total_seconds().div(3600).clip(lower=0).fillna(0)
+        else:
+            fee_hours = pd.Series(0.0, index=data.index)
 
         results = []
 
@@ -274,13 +286,18 @@ class UniswapV3Strategy:
             # 计算无常损失
             il = self.calculate_impermanent_loss(current_price)
 
-            # 价格是否在区间内
+            # 价格是否在区间内(闭区间，历史展示口径，保持旧列语义)
             in_range = self.price_range_lower <= current_price <= self.price_range_upper
 
-            # 计算LP手续费收入：只有价格在区间内才赚手续费(不复投)
+            # 计算LP手续费收入：仅当仓位处于双边混合状态才计费(不复投)。
+            # 计费用开区间：恰好在边界时calculate_lp_position已是100%单边资产、
+            # 流动性不活跃，不应赚费(Uniswap实际以tick半开区间判活跃)
+            fee_active = (
+                self.price_range_lower < current_price < self.price_range_upper
+            )
             fee_income = 0
-            if in_range:
-                fee_income = lp_value * self.fee_apr / (365 * 24) * hours_passed
+            if fee_active:
+                fee_income = lp_value * self.fee_apr / (365 * 24) * fee_hours[i]
                 self.total_fee_income += fee_income
 
             # 计算总价值 (含LP手续费收入)
@@ -371,20 +388,28 @@ class UniswapV3Strategy:
         impermanent_loss_annual = annualize(last_row["impermanent_loss"])
         final_gain_annual = hedge_vs_hodl_annual - impermanent_loss_annual
 
+        # 汇总一律从传入的results读取，避免实例复用时串到别次回测的状态
+        total_fee_income = last_row["total_fee_income"]
+        total_funding_cost = last_row["total_funding_cost"]
+        total_hedge_cost = last_row["hedge_cost"]
+        hedge_count = int(results["hedge_adjusted"].sum())
+
         # 计算资费和对冲成本的年化值
-        funding_cost_pct = (self.total_funding_cost / self.initial_capital) * 100
+        funding_cost_pct = (total_funding_cost / self.initial_capital) * 100
         funding_cost_annual = annualize(funding_cost_pct)
 
-        hedge_cost_pct = (self.total_hedge_cost / self.initial_capital) * 100
+        hedge_cost_pct = (total_hedge_cost / self.initial_capital) * 100
         hedge_cost_annual = annualize(hedge_cost_pct)
 
         # 计算总成本的年化值
         total_cost_pct = funding_cost_pct + hedge_cost_pct
         total_cost_annual = annualize(total_cost_pct)
 
-        # 手续费收入(占初始资金百分比)及其年化
-        fee_income_pct = (self.total_fee_income / self.initial_capital) * 100
-        fee_income_annual = annualize(fee_income_pct)
+        # 手续费收入(占初始资金百分比)及其年化。
+        # 手续费是线性累积、不复投，用简单比例年化(R/年数)，
+        # 不用上面的几何复利annualize，否则会虚增费率
+        fee_income_pct = (total_fee_income / self.initial_capital) * 100
+        fee_income_annual = fee_income_pct / years if years > 0 else fee_income_pct
 
         # 计算HODL盈亏和LP盈亏（绝对值，USDT）
         hodl_pnl = last_row["hodl_value"] - self.initial_capital
@@ -404,10 +429,10 @@ class UniswapV3Strategy:
             "价格在区间内的时间百分比": f"{in_range_pct:.2f}%",
             "时间段": f"{first_row['timestamp']} 至 {last_row['timestamp']}",
             "## 绝对表现": "",
-            "对冲调整次数": self.hedge_count,
-            "手续费收入": f"{self.total_fee_income:.2f} USDT",
-            "资金费用": f"{self.total_funding_cost:.2f} USDT",
-            "对冲成本": f"{self.total_hedge_cost:.2f} USDT",
+            "对冲调整次数": hedge_count,
+            "手续费收入": f"{total_fee_income:.2f} USDT",
+            "资金费用": f"{total_funding_cost:.2f} USDT",
+            "对冲成本": f"{total_hedge_cost:.2f} USDT",
             "HODL盈亏": f"{hodl_pnl:.2f} USDT",
             "LP盈亏": f"{lp_pnl:.2f} USDT",
             "## 相对表现": "",
@@ -422,7 +447,7 @@ class UniswapV3Strategy:
             "HODL收益率(年化)": f"{hodl_return_annual:.2f}%/年",
             "对冲相对HODL收益率(年化)": f"{hedge_vs_hodl_annual:.2f}%/年",
             "最终无常损失(年化)": f"{impermanent_loss_annual:.2f}%/年",
-            "手续费收益率(年化)": f"{fee_income_annual:.2f}%/年",
+            "手续费收益率(年化·线性)": f"{fee_income_annual:.2f}%/年",
             "最终增益(年化)": f"{final_gain_annual:.2f}%/年",
             "对冲成本(年化)": f"{hedge_cost_annual:.2f}%/年",
             "资费(年化)": f"{funding_cost_annual:.2f}%/年",

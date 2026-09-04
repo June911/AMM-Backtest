@@ -24,7 +24,7 @@ class UniswapV2Strategy:
             gas_cost_per_hedge (float): 对冲交易的费率(交易量的百分比，如0.001表示0.1%)
             fee_apr (float): LP手续费收益的年化率(如0.15表示15%)，按当前LP仓位价值
                 逐小时线性累积，不复投回池子。取值可参考目标池子的
-                手续费APR(日成交量×费率/TVL)。默认0保持旧行为。
+                手续费APR ≈ 日成交量×费率/TVL×365。默认0保持旧行为。
         """
         self.initial_capital = initial_capital
         self.price_threshold = price_threshold
@@ -147,9 +147,21 @@ class UniswapV2Strategy:
         initial_price = data.iloc[0]["close"]
         self.initialize_position(initial_price)
 
-        # 重置累积对冲盈亏和手续费收入
+        # 重置累积状态(同一实例多次run不互相污染)
         self.cumulative_hedge_pnl = 0
         self.total_fee_income = 0
+        self.total_hedge_cost = 0
+        self.total_funding_cost = 0
+        self.hedge_count = 0
+        self.hedge_history = []
+
+        # 手续费按行间实际时间差计费(首行无时间流逝不计费)，
+        # 兼容缺失K线与非小时数据；乱序数据的负时间差按0处理
+        if self.fee_apr:
+            ts = pd.to_datetime(data["timestamp"])
+            fee_hours = ts.diff().dt.total_seconds().div(3600).clip(lower=0).fillna(0)
+        else:
+            fee_hours = pd.Series(0.0, index=data.index)
 
         results = []
 
@@ -172,8 +184,8 @@ class UniswapV2Strategy:
             hours_passed = 1
             funding_fee = self.calculate_funding_fee(hours_passed)
 
-            # 计算LP手续费收入(按当前LP仓位价值×小时费率累积，不复投)
-            fee_income = lp_value * self.fee_apr / (365 * 24) * hours_passed
+            # 计算LP手续费收入(按当前LP仓位价值×实际经过小时数累积，不复投)
+            fee_income = lp_value * self.fee_apr / (365 * 24) * fee_hours[i]
             self.total_fee_income += fee_income
 
             # 计算对冲PnL
@@ -282,18 +294,24 @@ class UniswapV2Strategy:
         impermanent_loss_annual = annualize(last_row["impermanent_loss"])
         final_gain_annual = annualize(final_gain)
 
+        # 汇总一律从传入的results读取，避免实例复用时串到别次回测的状态
+        total_fee_income = last_row["total_fee_income"]
+        total_funding_cost = last_row["total_funding_cost"]
+        total_hedge_cost = last_row["hedge_cost"]
+        hedge_count = int(results["hedge_adjusted"].sum())
+
         # 手续费收入(占初始资金百分比)及其年化
-        fee_income_pct = (self.total_fee_income / self.initial_capital) * 100
+        fee_income_pct = (total_fee_income / self.initial_capital) * 100
         fee_income_annual = annualize(fee_income_pct)
 
         return {
             "初始资金": self.initial_capital,
             "手续费APR假设": f"{self.fee_apr * 100:.2f}%",
             "时间段": f"{first_row['timestamp']} 至 {last_row['timestamp']}",
-            "手续费收入": f"{self.total_fee_income:.2f} USDT",
-            "资金费用": f"{self.total_funding_cost:.2f} USDT",
-            "对冲成本": f"{self.total_hedge_cost:.2f} USDT",
-            "对冲调整次数": self.hedge_count,
+            "手续费收入": f"{total_fee_income:.2f} USDT",
+            "资金费用": f"{total_funding_cost:.2f} USDT",
+            "对冲成本": f"{total_hedge_cost:.2f} USDT",
+            "对冲调整次数": hedge_count,
             "ETH价格变化": f"{(last_row['price'] / first_row['price'] - 1) * 100:.2f}%",
             "不对冲收益率": f"{last_row['unhedged_return']:.2f}%",
             "对冲收益率": f"{last_row['hedged_return']:.2f}%",
