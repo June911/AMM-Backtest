@@ -26,10 +26,12 @@ class UniswapV3Strategy:
             price_threshold (float): 价格波动阈值，触发对冲的百分比(如0.01表示1%)
             funding_rate (float): 年化资金费率(如0.05表示5%)
             gas_cost_per_hedge (float): 对冲交易的费率(交易量的百分比，如0.001表示0.1%)
-            fee_apr (float): 价格在区间内时LP手续费收益的年化率(如0.3表示30%)，
-                按当前LP仓位价值逐小时线性累积，出区间时不计费、不复投。
-                注意这是"本仓位在区间内"的费率(集中流动性会放大费率，
-                可参考同区间宽度仓位的实际APR)，不是全池平均APR。默认0保持旧行为。
+            fee_apr (float): 价格在区间内时LP手续费收益的年化率(如0.3表示30%)。
+                按计费区间起点(上一行)的活跃态与仓位价值×行间实际时长线性累积，
+                不复投；活跃判定为下闭上开 [lower, upper)，与Uniswap tick语义一致；
+                缺口时段的区间状态以起点近似。注意这是"本仓位在区间内"的费率
+                (集中流动性会放大费率，可参考同区间宽度仓位的实际APR)，
+                不是全池平均APR。默认0保持旧行为。
         """
         self.initial_capital = initial_capital
         self.price_range_lower = price_range_lower
@@ -228,6 +230,10 @@ class UniswapV3Strategy:
         initial_price = data.iloc[0]["close"]
         self.initialize_position(initial_price)
 
+        # 归一索引：循环内把 i 同时当标签和位置用(iloc[i-1]/fee_hours[i])，
+        # 过滤后未重置索引的数据(如get_price的缓存切片)在这里统一矫正
+        data = data.reset_index(drop=True)
+
         # 重置累积状态(同一实例多次run不互相污染)
         self.cumulative_hedge_pnl = 0
         self.total_fee_income = 0
@@ -237,14 +243,20 @@ class UniswapV3Strategy:
         self.hedge_history = []
 
         # 手续费按行间实际时间差计费(首行无时间流逝不计费)，
-        # 兼容缺失K线与非小时数据；乱序数据的负时间差按0处理
+        # 兼容缺失K线与非小时数据；乱序时间戳会静默重复计时，直接拒绝
         if self.fee_apr:
             ts = pd.to_datetime(data["timestamp"])
-            fee_hours = ts.diff().dt.total_seconds().div(3600).clip(lower=0).fillna(0)
+            fee_hours = ts.diff().dt.total_seconds().div(3600).fillna(0)
+            if (fee_hours < 0).any():
+                raise ValueError(
+                    "timestamp非单调递增，无法按时间差计费；请先按时间排序数据"
+                )
         else:
             fee_hours = pd.Series(0.0, index=data.index)
 
         results = []
+        prev_lp_value = None  # 上一行LP仓位价值(计费用区间起点值)
+        prev_fee_active = False  # 上一行是否处于计费活跃态
 
         for i, row in data.iterrows():
             timestamp = row["timestamp"]
@@ -289,15 +301,17 @@ class UniswapV3Strategy:
             # 价格是否在区间内(闭区间，历史展示口径，保持旧列语义)
             in_range = self.price_range_lower <= current_price <= self.price_range_upper
 
-            # 计算LP手续费收入：仅当仓位处于双边混合状态才计费(不复投)。
-            # 计费用开区间：恰好在边界时calculate_lp_position已是100%单边资产、
-            # 流动性不活跃，不应赚费(Uniswap实际以tick半开区间判活跃)
+            # 当前行的计费活跃态：下闭上开 [lower, upper)，
+            # 与Uniswap V3 tick活跃语义(tickLower <= current < tickUpper)一致
             fee_active = (
-                self.price_range_lower < current_price < self.price_range_upper
+                self.price_range_lower <= current_price < self.price_range_upper
             )
+
+            # 计算LP手续费收入：按计费区间起点(上一行)的活跃态与仓位价值累积，
+            # 不复投；缺口时段的区间状态以起点近似(路径未知，这是显式约定)
             fee_income = 0
-            if fee_active:
-                fee_income = lp_value * self.fee_apr / (365 * 24) * fee_hours[i]
+            if prev_lp_value is not None and prev_fee_active:
+                fee_income = prev_lp_value * self.fee_apr / (365 * 24) * fee_hours[i]
                 self.total_fee_income += fee_income
 
             # 计算总价值 (含LP手续费收入)
@@ -342,6 +356,9 @@ class UniswapV3Strategy:
                     * 100,  # 百分比
                 }
             )
+
+            prev_lp_value = lp_value
+            prev_fee_active = fee_active
 
         return pd.DataFrame(results)
 
@@ -388,8 +405,9 @@ class UniswapV3Strategy:
         impermanent_loss_annual = annualize(last_row["impermanent_loss"])
         final_gain_annual = hedge_vs_hodl_annual - impermanent_loss_annual
 
-        # 汇总一律从传入的results读取，避免实例复用时串到别次回测的状态
-        total_fee_income = last_row["total_fee_income"]
+        # 汇总一律从传入的results读取，避免实例复用时串到别次回测的状态；
+        # 旧版保存的results没有手续费列，按0处理
+        total_fee_income = last_row.get("total_fee_income", 0)
         total_funding_cost = last_row["total_funding_cost"]
         total_hedge_cost = last_row["hedge_cost"]
         hedge_count = int(results["hedge_adjusted"].sum())
@@ -580,12 +598,13 @@ class UniswapV3Strategy:
 
         # 图5: 成本
         plt.subplot(5, 1, 5)
-        plt.plot(
-            results["timestamp"],
-            results["total_fee_income"],
-            label="手续费收入",
-            color="green",
-        )
+        if "total_fee_income" in results.columns:  # 旧版results无此列
+            plt.plot(
+                results["timestamp"],
+                results["total_fee_income"],
+                label="手续费收入",
+                color="green",
+            )
         plt.plot(results["timestamp"], results["total_funding_cost"], label="资金费用")
         plt.plot(results["timestamp"], results["hedge_cost"], label="对冲成本")
         plt.title("LP手续费收入与对冲相关成本")

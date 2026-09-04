@@ -22,8 +22,9 @@ class UniswapV2Strategy:
             price_threshold (float): 价格波动阈值，触发对冲的百分比(如0.01表示1%)
             funding_rate (float): 年化资金费率(如0.05表示5%)
             gas_cost_per_hedge (float): 对冲交易的费率(交易量的百分比，如0.001表示0.1%)
-            fee_apr (float): LP手续费收益的年化率(如0.15表示15%)，按当前LP仓位价值
-                逐小时线性累积，不复投回池子。取值可参考目标池子的
+            fee_apr (float): LP手续费收益的年化率(如0.15表示15%)。按计费区间
+                起点(上一行)的LP仓位价值×行间实际时长线性累积，不复投回池子；
+                首行无时间流逝不计费。取值可参考目标池子的
                 手续费APR ≈ 日成交量×费率/TVL×365。默认0保持旧行为。
         """
         self.initial_capital = initial_capital
@@ -147,6 +148,10 @@ class UniswapV2Strategy:
         initial_price = data.iloc[0]["close"]
         self.initialize_position(initial_price)
 
+        # 归一索引：循环内把 i 同时当标签和位置用(iloc[i-1]/fee_hours[i])，
+        # 过滤后未重置索引的数据(如get_price的缓存切片)在这里统一矫正
+        data = data.reset_index(drop=True)
+
         # 重置累积状态(同一实例多次run不互相污染)
         self.cumulative_hedge_pnl = 0
         self.total_fee_income = 0
@@ -156,14 +161,19 @@ class UniswapV2Strategy:
         self.hedge_history = []
 
         # 手续费按行间实际时间差计费(首行无时间流逝不计费)，
-        # 兼容缺失K线与非小时数据；乱序数据的负时间差按0处理
+        # 兼容缺失K线与非小时数据；乱序时间戳会静默重复计时，直接拒绝
         if self.fee_apr:
             ts = pd.to_datetime(data["timestamp"])
-            fee_hours = ts.diff().dt.total_seconds().div(3600).clip(lower=0).fillna(0)
+            fee_hours = ts.diff().dt.total_seconds().div(3600).fillna(0)
+            if (fee_hours < 0).any():
+                raise ValueError(
+                    "timestamp非单调递增，无法按时间差计费；请先按时间排序数据"
+                )
         else:
             fee_hours = pd.Series(0.0, index=data.index)
 
         results = []
+        prev_lp_value = None  # 上一行LP仓位价值(计费用区间起点值)
 
         for i, row in data.iterrows():
             timestamp = row["timestamp"]
@@ -184,9 +194,12 @@ class UniswapV2Strategy:
             hours_passed = 1
             funding_fee = self.calculate_funding_fee(hours_passed)
 
-            # 计算LP手续费收入(按当前LP仓位价值×实际经过小时数累积，不复投)
-            fee_income = lp_value * self.fee_apr / (365 * 24) * fee_hours[i]
-            self.total_fee_income += fee_income
+            # 计算LP手续费收入：按区间起点(上一行)的仓位价值×行间时长累积，
+            # 不复投；缺口时段以区间起点状态近似
+            fee_income = 0
+            if prev_lp_value is not None:
+                fee_income = prev_lp_value * self.fee_apr / (365 * 24) * fee_hours[i]
+                self.total_fee_income += fee_income
 
             # 计算对冲PnL
             hedge_pnl = 0
@@ -250,6 +263,8 @@ class UniswapV2Strategy:
                 }
             )
 
+            prev_lp_value = lp_value
+
         return pd.DataFrame(results)
 
     def get_summary(self, results):
@@ -294,8 +309,9 @@ class UniswapV2Strategy:
         impermanent_loss_annual = annualize(last_row["impermanent_loss"])
         final_gain_annual = annualize(final_gain)
 
-        # 汇总一律从传入的results读取，避免实例复用时串到别次回测的状态
-        total_fee_income = last_row["total_fee_income"]
+        # 汇总一律从传入的results读取，避免实例复用时串到别次回测的状态；
+        # 旧版保存的results没有手续费列，按0处理
+        total_fee_income = last_row.get("total_fee_income", 0)
         total_funding_cost = last_row["total_funding_cost"]
         total_hedge_cost = last_row["hedge_cost"]
         hedge_count = int(results["hedge_adjusted"].sum())
@@ -477,12 +493,13 @@ class UniswapV2Strategy:
 
         # 图4: 收入与成本
         plt.subplot(4, 1, 4)
-        plt.plot(
-            results["timestamp"],
-            results["total_fee_income"],
-            label="手续费收入",
-            color="green",
-        )
+        if "total_fee_income" in results.columns:  # 旧版results无此列
+            plt.plot(
+                results["timestamp"],
+                results["total_fee_income"],
+                label="手续费收入",
+                color="green",
+            )
         plt.plot(results["timestamp"], results["total_funding_cost"], label="资金费用")
         plt.plot(results["timestamp"], results["hedge_cost"], label="对冲成本")
         plt.title("LP手续费收入与对冲相关成本")

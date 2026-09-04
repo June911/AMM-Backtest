@@ -19,7 +19,7 @@ def run_pipeline():
         initial_capital=1000,
         price_threshold=0.05,
         funding_rate=0.1,
-        fee_apr=0.10,  # LP手续费年化率，按目标池子实际费率APR填(成交量×费率/TVL)
+        fee_apr=0.10,  # LP手续费年化率，按目标池子费率APR填(日成交量×费率/TVL×365)
     )
     results = strat.run(df)
     strat.save_results(results, "v2_backtest_results")
