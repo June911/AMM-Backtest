@@ -14,11 +14,12 @@ def run_pipeline():
     df = fetch_price_data(symbol, start_date, end_date, timeframe)
     initial_price = df.iloc[0]["close"]
 
-    # 回测 uni v3 策略
+    # 回测 uni v2 策略
     strat = UniswapV2Strategy(
         initial_capital=1000,
         price_threshold=0.05,
         funding_rate=0.1,
+        fee_apr=0.10,  # LP手续费年化率，按目标池子实际费率APR填(成交量×费率/TVL)
     )
     results = strat.run(df)
     strat.save_results(results, "v2_backtest_results")
@@ -31,6 +32,7 @@ def run_pipeline():
         price_threshold=0.05,
         funding_rate=0.1,
         gas_cost_per_hedge=0.0003,
+        fee_apr=0.20,  # 区间内的手续费年化率(集中流动性放大后)，出区间自动停止计费
     )
     results = strat.run(df)
     strat.save_results(results, "v3_backtest_results")

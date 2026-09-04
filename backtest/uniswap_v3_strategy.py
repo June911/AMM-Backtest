@@ -14,6 +14,7 @@ class UniswapV3Strategy:
         price_threshold,
         funding_rate,
         gas_cost_per_hedge=0.001,
+        fee_apr=0.0,
     ):
         """
         初始化Uniswap V3 LP策略
@@ -25,6 +26,10 @@ class UniswapV3Strategy:
             price_threshold (float): 价格波动阈值，触发对冲的百分比(如0.01表示1%)
             funding_rate (float): 年化资金费率(如0.05表示5%)
             gas_cost_per_hedge (float): 对冲交易的费率(交易量的百分比，如0.001表示0.1%)
+            fee_apr (float): 价格在区间内时LP手续费收益的年化率(如0.3表示30%)，
+                按当前LP仓位价值逐小时线性累积，出区间时不计费、不复投。
+                注意这是"本仓位在区间内"的费率(集中流动性会放大费率，
+                可参考同区间宽度仓位的实际APR)，不是全池平均APR。默认0保持旧行为。
         """
         self.initial_capital = initial_capital
         self.price_range_lower = price_range_lower
@@ -32,10 +37,12 @@ class UniswapV3Strategy:
         self.price_threshold = price_threshold
         self.funding_rate = funding_rate
         self.gas_cost_per_hedge = gas_cost_per_hedge
+        self.fee_apr = fee_apr
 
         # 跟踪指标
         self.total_hedge_cost = 0
         self.total_funding_cost = 0
+        self.total_fee_income = 0  # 累积LP手续费收入(仅在区间内累积)
         self.hedge_count = 0
         self.hedge_history = []
         self.cumulative_hedge_pnl = 0
@@ -221,8 +228,9 @@ class UniswapV3Strategy:
         initial_price = data.iloc[0]["close"]
         self.initialize_position(initial_price)
 
-        # 重置累积对冲盈亏
+        # 重置累积对冲盈亏和手续费收入
         self.cumulative_hedge_pnl = 0
+        self.total_fee_income = 0
 
         results = []
 
@@ -269,10 +277,17 @@ class UniswapV3Strategy:
             # 价格是否在区间内
             in_range = self.price_range_lower <= current_price <= self.price_range_upper
 
-            # 计算总价值
-            unhedged_value = lp_value
+            # 计算LP手续费收入：只有价格在区间内才赚手续费(不复投)
+            fee_income = 0
+            if in_range:
+                fee_income = lp_value * self.fee_apr / (365 * 24) * hours_passed
+                self.total_fee_income += fee_income
+
+            # 计算总价值 (含LP手续费收入)
+            unhedged_value = lp_value + self.total_fee_income
             hedged_value = (
                 lp_value
+                + self.total_fee_income
                 + self.cumulative_hedge_pnl
                 - self.total_hedge_cost
                 - self.total_funding_cost
@@ -286,14 +301,17 @@ class UniswapV3Strategy:
                     "in_range": in_range,
                     "lp_value": lp_value,
                     "hodl_value": hodl_value,
-                    "lp_vs_hodl": lp_value - hodl_value,  # LP策略与HODL策略的差额
+                    "lp_vs_hodl": unhedged_value
+                    - hodl_value,  # LP策略(含手续费)与HODL策略的差额
                     "hedge_vs_hodl": hedged_value
                     - hodl_value,  # 对冲策略与HODL策略的差额
-                    "impermanent_loss": il * 100,  # 转换为百分比
+                    "impermanent_loss": il * 100,  # 转换为百分比(纯价格效应，不含手续费)
                     "eth_amount": eth_amount,
                     "usdt_amount": usdt_amount,
                     "hedge_position": self.hedge_position,
                     "hedge_adjusted": hedge_adjusted,
+                    "fee_income": fee_income,
+                    "total_fee_income": self.total_fee_income,
                     "funding_fee": funding_fee,
                     "total_funding_cost": self.total_funding_cost,
                     "hedge_cost": self.total_hedge_cost,
@@ -364,6 +382,10 @@ class UniswapV3Strategy:
         total_cost_pct = funding_cost_pct + hedge_cost_pct
         total_cost_annual = annualize(total_cost_pct)
 
+        # 手续费收入(占初始资金百分比)及其年化
+        fee_income_pct = (self.total_fee_income / self.initial_capital) * 100
+        fee_income_annual = annualize(fee_income_pct)
+
         # 计算HODL盈亏和LP盈亏（绝对值，USDT）
         hodl_pnl = last_row["hodl_value"] - self.initial_capital
         lp_pnl = last_row["lp_value"] - self.initial_capital
@@ -378,10 +400,12 @@ class UniswapV3Strategy:
             "初始资金": self.initial_capital,
             "价格区间": f"[{self.price_range_lower}, {self.price_range_upper}]",
             "对冲区间": f"{self.price_threshold}",
+            "手续费APR假设(区间内)": f"{self.fee_apr * 100:.2f}%",
             "价格在区间内的时间百分比": f"{in_range_pct:.2f}%",
             "时间段": f"{first_row['timestamp']} 至 {last_row['timestamp']}",
             "## 绝对表现": "",
             "对冲调整次数": self.hedge_count,
+            "手续费收入": f"{self.total_fee_income:.2f} USDT",
             "资金费用": f"{self.total_funding_cost:.2f} USDT",
             "对冲成本": f"{self.total_hedge_cost:.2f} USDT",
             "HODL盈亏": f"{hodl_pnl:.2f} USDT",
@@ -398,6 +422,7 @@ class UniswapV3Strategy:
             "HODL收益率(年化)": f"{hodl_return_annual:.2f}%/年",
             "对冲相对HODL收益率(年化)": f"{hedge_vs_hodl_annual:.2f}%/年",
             "最终无常损失(年化)": f"{impermanent_loss_annual:.2f}%/年",
+            "手续费收益率(年化)": f"{fee_income_annual:.2f}%/年",
             "最终增益(年化)": f"{final_gain_annual:.2f}%/年",
             "对冲成本(年化)": f"{hedge_cost_annual:.2f}%/年",
             "资费(年化)": f"{funding_cost_annual:.2f}%/年",
@@ -530,9 +555,15 @@ class UniswapV3Strategy:
 
         # 图5: 成本
         plt.subplot(5, 1, 5)
+        plt.plot(
+            results["timestamp"],
+            results["total_fee_income"],
+            label="手续费收入",
+            color="green",
+        )
         plt.plot(results["timestamp"], results["total_funding_cost"], label="资金费用")
         plt.plot(results["timestamp"], results["hedge_cost"], label="对冲成本")
-        plt.title("对冲相关成本")
+        plt.title("LP手续费收入与对冲相关成本")
         plt.ylabel("USDT")
         plt.legend()
         plt.grid(True)
